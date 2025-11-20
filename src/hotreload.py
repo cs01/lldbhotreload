@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
 import re
 import shlex
 import struct
@@ -204,16 +205,16 @@ class FileHotReload:
         """
         Find all functions in a source file that can be hot reloaded.
         Uses clang AST dump for accurate, bulletproof parsing.
-        Falls back to DWARF-only if AST parsing fails.
+        Requires clang++ compiler - will error if not available.
         """
         source_path = Path(source_file).resolve()
 
         # Get compiler flags
         compile_flags = self.load_compile_commands(source_path)
         if not compile_flags:
-            # No compile_commands.json - can't do AST dump
-            self.log(f"  Warning: No compile_commands.json found, skipping AST analysis")
-            return []
+            raise RuntimeError(
+                f"No compile_commands.json found for {source_path}. AST analysis requires compilation database."
+            )
 
         # Extract the real compiler from compilation database
         # Some build systems use wrapper scripts that pass the real compiler via --cc=
@@ -226,9 +227,11 @@ class FileHotReload:
         if not compiler:
             compiler = compile_flags[0]
 
-        # If compiler is not clang++, fall back to system clang++
+        # Require clang++ compiler
         if not compiler.endswith("clang++"):
-            compiler = "/opt/llvm/bin/clang++"
+            raise RuntimeError(
+                f"Compiler must be clang++, but got: {compiler}. Hot reloading requires clang for AST parsing."
+            )
 
         # Build minimal AST dump command (TEXT format, not JSON)
         # Text format is much faster and doesn't have the 592MB JSON parsing issues
@@ -237,7 +240,11 @@ class FileHotReload:
         # Extract only essential flags from compile_commands
         for flag in compile_flags[1:]:
             # Keep include paths and defines
-            if flag.startswith("-I") or flag.startswith("-D") or flag.startswith("-std="):
+            if (
+                flag.startswith("-I")
+                or flag.startswith("-D")
+                or flag.startswith("-std=")
+            ):
                 cmd.append(flag)
             # Keep system paths
             elif flag.startswith("-idirafter") or flag.startswith("-isystem"):
@@ -248,15 +255,11 @@ class FileHotReload:
 
         cmd.append(str(source_path))
 
-        self.log(f"  Running clang AST dump (text format, timeout=15s)...")
+        self.log(f"  Getting clang AST...")
 
         try:
             result = subprocess.run(
-                cmd,
-                capture_output=True,
-                text=True,
-                timeout=15,
-                cwd=Path.cwd()
+                cmd, capture_output=True, text=True, timeout=15, cwd=Path.cwd()
             )
 
             # Combine stdout and stderr (AST dump goes to stdout, errors to stderr)
@@ -266,7 +269,7 @@ class FileHotReload:
             functions = []
             source_filename = source_path.name
 
-            for line in output.split('\n'):
+            for line in output.split("\n"):
                 # Look for top-level FunctionDecl lines from the main source file
                 # (top-level = starts with "|-FunctionDecl", not nested in templates)
                 #
@@ -281,11 +284,20 @@ class FileHotReload:
                 # ✗ Reject: destructors (start with ~)
                 # ✗ Reject: class methods (:: in name before paren)
                 #
-                if not line.startswith("|-FunctionDecl"):
+                # Accept top-level functions (start with |- or `- in AST tree notation)
+                if not (
+                    line.startswith("|-FunctionDecl")
+                    or line.startswith("`-FunctionDecl")
+                ):
                     continue
 
-                # Only accept functions from the main source file (<line:X:Y> format)
-                if not ("<line:" in line and " line:" in line):
+                # Only accept functions from the main source file
+                # Accept both <file.cpp:L:C> and <line:L:C> formats
+                if " line:" not in line:
+                    continue
+
+                # Reject functions from header files
+                if ".h:" in line:
                     continue
 
                 # Reject macro-generated functions (identified by <scratch space>)
@@ -331,7 +343,7 @@ class FileHotReload:
 
                 # Skip class methods (have :: in name)
                 # Extract the part before first paren (if any)
-                name_part = func_name.split('(')[0] if '(' in func_name else func_name
+                name_part = func_name.split("(")[0] if "(" in func_name else func_name
                 if "::" in name_part:
                     continue
 
@@ -343,21 +355,29 @@ class FileHotReload:
             return functions
 
         except subprocess.TimeoutExpired:
-            self.log(f"  Warning: Clang AST dump timed out, using DWARF symbols only")
-            return []
-        except (FileNotFoundError, RuntimeError) as e:
-            self.log(f"  Warning: AST parsing failed ({str(e)[:100]}), using DWARF symbols only")
-            return []
+            raise RuntimeError(
+                f"Clang AST dump timed out after 15 seconds for {source_path}"
+            )
+        except FileNotFoundError as e:
+            raise RuntimeError(
+                f"Clang compiler not found: {compiler}. Ensure clang++ is installed and in PATH."
+            ) from e
+        except Exception as e:
+            raise RuntimeError(f"AST parsing failed for {source_path}: {str(e)}") from e
 
     def compile_file_to_shared_lib(
-        self, source_file: str | Path, compile_flags: Optional[List[str]] = None,
-        functions_to_compile: Optional[List[str]] = None
+        self,
+        source_file: str | Path,
+        compile_flags: Optional[List[str]] = None,
+        functions_to_compile: Optional[List[str]] = None,
     ) -> Optional[Tuple[Path, Dict[str, int]]]:
 
         if compile_flags is None:
             compile_flags = self.load_compile_commands(source_file)
             if compile_flags is None:
-                compile_flags = ["clang++", "-std=c++17", "-O0", "-g"]
+                raise RuntimeError(
+                    f"No compile_commands.json found for {source_file}. Hot reloading requires a compilation database."
+                )
 
         source_path: Path = Path(source_file).resolve()
         with open(source_path, "rb") as f:
@@ -488,6 +508,12 @@ class FileHotReload:
                 compiler = flag.split("=", 1)[1]
                 break
 
+        # Require clang++ compiler
+        if not compiler.endswith("clang++"):
+            raise RuntimeError(
+                f"Compiler must be clang++, but got: {compiler}. Hot reloading requires clang for compilation."
+            )
+
         # Filter out flags that conflict with our compilation
         # We only remove flags that specify input/output files
         # All compiler flags (includes, defines, warnings, optimizations) are preserved
@@ -539,21 +565,22 @@ class FileHotReload:
 
         self.log(f"  → {' '.join(cmd_compile)}")
 
+        # Ensure PATH includes standard compiler locations
+        env = os.environ.copy()
+        env["PATH"] = "/usr/bin:/usr/local/bin:" + env.get("PATH", "")
+
         result: subprocess.CompletedProcess[str] = subprocess.run(
-            cmd_compile, capture_output=True, text=True, timeout=30
+            cmd_compile, capture_output=True, text=True, timeout=30, env=env
         )
         if result.returncode != 0:
             self.log(f"✗ Compilation failed:\n{result.stderr}")
             return None
 
-        # Step 2: Link object file to shared library (.so) using clean system flags
-        # This avoids build-system-specific linker issues and creates a standard shared library
+        # Step 2: Link object file to shared library (.so) using minimal flags
+        # Let the compiler use its default library paths to avoid compatibility issues
         cmd_link: List[str] = [
             compiler,
             "-shared",
-            "-L/usr/lib/gcc/x86_64-redhat-linux/11",  # System GCC libs
-            "-L/lib64",  # System libraries
-            "-lstdc++",  # C++ standard library
             "-o",
             str(temp_so),
             str(temp_obj),
@@ -562,7 +589,7 @@ class FileHotReload:
         self.log(f"  → {' '.join(cmd_link)}")
 
         result = subprocess.run(
-            cmd_link, capture_output=True, text=True, timeout=30
+            cmd_link, capture_output=True, text=True, timeout=30, env=env
         )
         if result.returncode != 0:
             self.log(f"✗ Linking failed:\n{result.stderr}")
@@ -589,7 +616,9 @@ class FileHotReload:
 
         result: Any = frame.EvaluateExpression(dlopen_cmd, options)
         if not result.GetError().Success():
-            self.log(f"  ⚠ Expression evaluation warning: {result.GetError().GetCString()}")
+            self.log(
+                f"  ⚠ Expression evaluation warning: {result.GetError().GetCString()}"
+            )
             # Don't return 0 here - check the handle value instead
 
         handle: int = result.GetValueAsUnsigned()
@@ -615,7 +644,9 @@ class FileHotReload:
                 self.log(f"✗ dlopen() failed: {error_msg}")
                 self.log("")
                 self.log("⚠ HINT: Build with -rdynamic")
-                self.log("  Example: clang++ -rdynamic -g -O0 your_files.cpp -o your_program")
+                self.log(
+                    "  Example: clang++ -rdynamic -g -O0 your_files.cpp -o your_program"
+                )
             else:
                 self.log(f"✗ dlopen() failed: {error_msg}")
             return 0
@@ -787,13 +818,19 @@ class FileHotReload:
 
                 # Check if this breakpoint is at or within the function being patched
                 if loc_addr >= old_addr and loc_addr < old_addr + func_size:
-                    self.log(f"  → Removing breakpoint #{breakpoint.GetID()} at 0x{loc_addr:x} (conflicts with trampoline)")
+                    self.log(
+                        f"  → Removing breakpoint #{breakpoint.GetID()} at 0x{loc_addr:x} (conflicts with trampoline)"
+                    )
                     self.target.BreakpointDelete(breakpoint.GetID())
                     breakpoints_removed += 1
                     break  # Break inner loop since we deleted the breakpoint
 
         if breakpoints_removed > 0:
             self.log(f"  → Removed {breakpoints_removed} conflicting breakpoint(s)")
+            # Clear memory first after removing breakpoints
+            nop_clear = bytes([0x90] * TRAMPOLINE_SIZE)
+            clear_error = lldb.SBError()
+            self.process.WriteMemory(old_addr, nop_clear, clear_error)
 
         if func_size < TRAMPOLINE_SIZE:
             self.log(
@@ -833,21 +870,25 @@ class FileHotReload:
 
             trampoline_hex = " ".join(f"{b:02x}" for b in trampoline)
             self.log(f"  → WriteMemory(0x{old_addr:x}, {func_size} bytes)")
-            self.log(f"     [{trampoline_hex}] + {remaining_size} NOPs")
             self.log(
                 f"     Disassembly: movabsq $0x{new_addr:x}, %rax; jmp *%rax; nop×{remaining_size}"
             )
 
             error: Any = lldb.SBError()
-            bytes_written = self.process.WriteMemory(
-                old_addr, bytes(patch_buffer), error
-            )
+            buffer_bytes = bytes(patch_buffer)
+
+            self.process.WriteMemory(old_addr, buffer_bytes, error)
 
             if not error.Success():
                 self.log(
                     f"✗ Failed to write JMP for {function_name}: {error.GetCString()}"
                 )
                 return False
+
+            # Verify write succeeded (LLDB bug: deleted breakpoints can corrupt writes)
+            verify_bytes = self.process.ReadMemory(old_addr, 12, error)
+            if verify_bytes and verify_bytes[10:12] != bytes([0xFF, 0xE0]):
+                self.log(f"     ⚠ WARNING: Memory write corrupted, restart debugger")
 
         self.patched_functions[function_name] = {
             "old_addr": old_addr,
@@ -990,10 +1031,14 @@ class FileHotReload:
             self.log("✗ No hotreloadable functions found")
             return (0, 0)
 
-        self.log(f"  Found {len(ast_functions)} hotreloadable function(s): {ast_functions}")
+        self.log(
+            f"  Found {len(ast_functions)} hotreloadable function(s): {ast_functions}"
+        )
 
         # Now use DWARF to get addresses for the AST-discovered functions
-        all_dwarf_functions: List[Dict[str, Any]] = self.find_functions_from_dwarf(source_path)
+        all_dwarf_functions: List[Dict[str, Any]] = self.find_functions_from_dwarf(
+            source_path
+        )
 
         # Filter DWARF results to only include AST-discovered functions
         # Need to match by base name since DWARF has signatures like "addOne(int)"
@@ -1009,7 +1054,9 @@ class FileHotReload:
                 dwarf_functions.append(dwarf_func)
 
         if not dwarf_functions:
-            self.log("✗ No DWARF symbols found for hotreloadable functions (compile with -g)")
+            self.log(
+                "✗ No DWARF symbols found for hotreloadable functions (compile with -g)"
+            )
             return (0, 0)
 
         skipped_on_stack: List[str] = []
@@ -1127,115 +1174,19 @@ class FileHotReload:
 
             success_count += 1
 
-        new_module: Any = self.loaded_libs.get(f"{so_path}_module")
         if success_count > 0:
-            patched_info: Dict[str, Dict[str, Any]] = {}
-
-            for func_info in dwarf_functions:
-                func_name = func_info["name"]
-                if (
-                    func_name in _FUNCTION_INFO
-                    and "line_number" in _FUNCTION_INFO[func_name]
-                ):
-                    patched_info[func_name] = {
-                        "line": _FUNCTION_INFO[func_name]["line_number"]
-                    }
-
-            deleted_count = 0
-            breakpoints_to_delete = []
-
-            for bp_idx in range(self.target.GetNumBreakpoints()):
-                breakpoint: Any = self.target.GetBreakpointAtIndex(bp_idx)
-                if not breakpoint.IsValid():
-                    continue
-
-                if breakpoint.MatchesName("hotreload_auto"):
-                    is_current = False
-                    for loc_idx in range(breakpoint.GetNumLocations()):
-                        location = breakpoint.GetLocationAtIndex(loc_idx)
-                        addr = location.GetAddress()
-                        if addr.IsValid():
-                            symbol = addr.GetSymbol()
-                            if symbol.IsValid():
-                                symbol_name = symbol.GetName()
-                                if f"_hotreload_{content_hash}" in symbol_name:
-                                    is_current = True
-                                    break
-
-                    if not is_current:
-                        breakpoints_to_delete.append(breakpoint.GetID())
-
-            for bp_id in breakpoints_to_delete:
-                self.target.BreakpointDelete(bp_id)
-                deleted_count += 1
-
-            if deleted_count > 0:
-                self.log(
-                    f"  Deleted {deleted_count} old breakpoint(s) from previous hot reloads"
-                )
-
             self.log(f"✓ Patched {success_count}/{len(dwarf_functions)} functions")
-
-            so_cpp_file = so_path.with_suffix(".cpp")
-            auto_bp_count = 0
-
-            for func_info in dwarf_functions:
-                func_name = func_info["name"]
-                if func_name not in self.patched_functions:
-                    continue
-
-                content_hash = so_path.stem.split("_")[-1]
-                base_func_name = (
-                    func_name.split("(")[0] if "(" in func_name else func_name
-                )
-                hotreload_func_name = f"{base_func_name}_hotreload_{content_hash}"
-
-                cmd = f"breakpoint set -n {hotreload_func_name} -K 0"
-                result = lldb.SBCommandReturnObject()
-                self.debugger.GetCommandInterpreter().HandleCommand(cmd, result)
-
-                if not result.Succeeded():
-                    self.log(f"  ⚠ Failed to create breakpoint: {result.GetError()}")
-                    continue
-
-                bp = self.target.GetBreakpointAtIndex(
-                    self.target.GetNumBreakpoints() - 1
-                )
-
-                if bp.IsValid():
-                    bp.AddName("hotreload_auto")
-
-                    if bp.GetNumLocations() > 0:
-                        auto_bp_count += 1
-                        location = bp.GetLocationAtIndex(0)
-                        addr = location.GetLoadAddress()
-                        line_entry = location.GetAddress().GetLineEntry()
-                        if line_entry.IsValid():
-                            line_num = line_entry.GetLine()
-                            self.log(
-                                f"  Auto-breakpoint: {func_name} at {so_cpp_file.name}:{line_num} (addr 0x{addr:x})"
-                            )
-                        else:
-                            self.log(f"  Auto-breakpoint: {func_name} at 0x{addr:x}")
-                    else:
-                        self.log(
-                            f"  ⚠ Breakpoint created but has no locations: {hotreload_func_name}"
-                        )
-                else:
-                    self.log(f"  ⚠ Could not retrieve created breakpoint")
 
             self.attach_breakpoint_callbacks()
 
-            so_cpp_file = so_path.with_suffix(".cpp")
             self.log("")
             self.log("=" * 60)
-            if auto_bp_count > 0:
-                self.log(
-                    f"  ✓ Created {auto_bp_count} auto-breakpoint(s) in hot-reloaded code"
-                )
-                self.log(f"  Next 'continue' will hit breakpoints in new code!")
-            self.log(f"  Breakpoints in {source_path.name} will now hit hot-reloaded code!")
-            self.log(f"  Alternative: b {so_cpp_file.name}:<line>")
+            self.log(f"  ✓ Hot reload complete!")
+            self.log(
+                f"  Breakpoints in {source_path.name} will now hit hot-reloaded code"
+            )
+            self.log(f"  Set breakpoints in the original source file as usual:")
+            self.log(f"    (lldb) b {source_path.name}:<line>")
             self.log("=" * 60)
 
             _PATCHED_FILE_HASHES[source_key] = current_hash
