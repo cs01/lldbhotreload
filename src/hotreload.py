@@ -5,6 +5,7 @@ from __future__ import annotations
 import hashlib
 import json
 import re
+import shlex
 import struct
 import subprocess
 import tempfile
@@ -48,10 +49,13 @@ def breakpoint_callback(frame: Any, bp_loc: Any, dict: Dict[str, Any]) -> bool:
 
     module_name = module.GetFileSpec().GetFilename()
 
-    if not module_name.startswith("hotreload_"):
-        return False
+    # If this breakpoint is in a hotreload module, allow it (stop execution)
+    if module_name.startswith("hotreload_"):
+        return False  # Stop here - this is the new code we want to debug
 
-    return True
+    # If this breakpoint is in the original binary (the trampoline), skip it
+    # Return True to continue execution - we don't want to stop at the trampoline!
+    return True  # Continue - don't stop at old code/trampoline
 
 
 class FileHotReload:
@@ -79,10 +83,18 @@ class FileHotReload:
                     with open(compile_commands) as f:
                         for entry in json.load(f):
                             if Path(entry.get("file", "")).name == source_name:
-                                parts: List[str] = entry.get("command", "").split()
-                                if not parts:
-                                    continue
-                                return parts
+                                # Prefer "arguments" (array, more precise) over "command" (string)
+                                if "arguments" in entry:
+                                    parts: List[str] = entry["arguments"]
+                                    if parts:
+                                        return parts
+                                # Fall back to "command" if "arguments" not present
+                                # Use shlex.split() to properly handle shell quoting
+                                command_str: str = entry.get("command", "")
+                                if command_str:
+                                    parts: List[str] = shlex.split(command_str)
+                                    if parts:
+                                        return parts
                 except (json.JSONDecodeError, KeyError, IOError):
                     pass
             parent: Path = current.parent
@@ -189,26 +201,110 @@ class FileHotReload:
         return functions
 
     def find_all_functions_in_file(self, source_file: str | Path) -> List[str]:
-        with open(source_file) as f:
-            content: str = f.read()
+        """
+        Find all functions in a source file that can be hot reloaded.
+        Uses clang AST dump for accurate, bulletproof parsing.
+        Falls back to DWARF-only if AST parsing fails.
+        """
+        source_path = Path(source_file).resolve()
 
-        pattern: str = (
-            r"\b(\w+(?:\s*<[^>]+>)?(?:\s*::\s*\w+)*)\s+(\w+)\s*\([^)]*\)\s*(?:const)?\s*(?:override)?\s*\{"
-        )
-        functions: List[str] = []
+        # Get compiler flags
+        compile_flags = self.load_compile_commands(source_path)
+        if not compile_flags:
+            # No compile_commands.json - can't do AST dump
+            self.log(f"  Warning: No compile_commands.json found, skipping AST analysis")
+            return []
 
-        for match in re.finditer(pattern, content):
-            return_type: str = match.group(1).strip()
-            func_name: str = match.group(2).strip()
-            if (
-                func_name != "main"
-                and not func_name.startswith("~")
-                and return_type not in ["", func_name]
-                and not func_name.startswith("__")
-            ):
-                functions.append(func_name)
+        # Extract the real compiler from Buck2's fbcc wrapper
+        compiler = None
+        for i, flag in enumerate(compile_flags):
+            if flag.startswith("--cc="):
+                compiler = flag.split("=", 1)[1]
+                break
 
-        return functions
+        if not compiler:
+            compiler = compile_flags[0]
+
+        # If it's still fbcc or a wrapper, try to find real clang++
+        if "fbcc" in compiler or not compiler.endswith("clang++"):
+            compiler = "/opt/llvm/bin/clang++"
+
+        # Build minimal AST dump command (TEXT format, not JSON)
+        # Text format is much faster and doesn't have the 592MB JSON parsing issues
+        cmd = [compiler, "-Xclang", "-ast-dump", "-fsyntax-only"]
+
+        # Extract only essential flags from compile_commands
+        for flag in compile_flags[1:]:
+            # Keep include paths and defines
+            if flag.startswith("-I") or flag.startswith("-D") or flag.startswith("-std="):
+                cmd.append(flag)
+            # Keep system paths
+            elif flag.startswith("-idirafter") or flag.startswith("-isystem"):
+                cmd.append(flag)
+            # Skip argsfiles - they can hang or reference build-time-only paths
+            elif flag.startswith("@"):
+                continue
+
+        cmd.append(str(source_path))
+
+        self.log(f"  Running clang AST dump (text format, timeout=15s)...")
+
+        try:
+            result = subprocess.run(
+                cmd,
+                capture_output=True,
+                text=True,
+                timeout=15,
+                cwd=Path.cwd()
+            )
+
+            # Combine stdout and stderr (AST dump goes to stdout, errors to stderr)
+            output = result.stdout + result.stderr
+
+            # Parse the text AST dump to find function declarations
+            functions = []
+            source_filename = source_path.name
+
+            for line in output.split('\n'):
+                # Look for FunctionDecl lines that reference our source file
+                # Format: |-FunctionDecl ... <file.cpp:line:col, ...> line:X:Y funcname 'signature'
+                if "FunctionDecl" in line and source_filename in line:
+                    # Extract function name and signature
+                    match = re.search(rf"{re.escape(source_filename)}:\d+:\d+.*?(\w+) '([^']+)'", line)
+                    if match:
+                        func_name = match.group(1)
+                        signature = match.group(2)
+
+                        # Filter out functions that can't be hot reloaded:
+                        # - main function
+                        # - Destructors (~ClassName)
+                        # - Internal functions (__xxx)
+                        # - Macro-generated variants (_1e0, _1e1, etc from BENCHMARK macros)
+                        # - Template instantiations (have < in signature)
+                        # - Class methods (have :: before the opening paren)
+
+                        # Check for :: in the function name part (before first paren if any)
+                        name_part = func_name.split('(')[0] if '(' in func_name else func_name
+
+                        if (func_name != "main" and
+                            not func_name.startswith("~") and
+                            not func_name.startswith("__") and
+                            "_1e" not in func_name and  # Skip BENCHMARK macro variants
+                            "::" not in name_part and  # Skip class methods
+                            "<" not in signature):  # Skip template instantiations
+
+                            if func_name not in functions:
+                                functions.append(func_name)
+
+            self.log(f"  AST found {len(functions)} hotreloadable functions")
+            return functions
+
+        except subprocess.TimeoutExpired:
+            self.log(f"  Warning: Clang AST dump timed out, using DWARF symbols only")
+            return []
+        except (FileNotFoundError, RuntimeError) as e:
+            self.log(f"  Warning: AST parsing failed ({str(e)[:100]}), using DWARF symbols only")
+            return []
 
     def compile_file_to_shared_lib(
         self, source_file: str | Path, compile_flags: Optional[List[str]] = None,
@@ -574,6 +670,29 @@ class FileHotReload:
             old_end_addr - old_addr if old_end_addr > old_addr else TRAMPOLINE_SIZE
         )
 
+        # CRITICAL: Remove any breakpoints at the original function address
+        # Breakpoints can interfere with trampoline execution, causing PC to skip
+        # past the first instruction (movabsq) and jump directly to the jmp *%rax
+        breakpoints_removed = 0
+        for bp_idx in range(self.target.GetNumBreakpoints()):
+            breakpoint: Any = self.target.GetBreakpointAtIndex(bp_idx)
+            if not breakpoint.IsValid():
+                continue
+
+            for loc_idx in range(breakpoint.GetNumLocations()):
+                location: Any = breakpoint.GetLocationAtIndex(loc_idx)
+                loc_addr: int = location.GetLoadAddress()
+
+                # Check if this breakpoint is at or within the function being patched
+                if loc_addr >= old_addr and loc_addr < old_addr + func_size:
+                    self.log(f"  → Removing breakpoint #{breakpoint.GetID()} at 0x{loc_addr:x} (conflicts with trampoline)")
+                    self.target.BreakpointDelete(breakpoint.GetID())
+                    breakpoints_removed += 1
+                    break  # Break inner loop since we deleted the breakpoint
+
+        if breakpoints_removed > 0:
+            self.log(f"  → Removed {breakpoints_removed} conflicting breakpoint(s)")
+
         if func_size < TRAMPOLINE_SIZE:
             self.log(
                 f"⚠ {function_name}: Function too small ({func_size} bytes), patching entry only"
@@ -762,25 +881,73 @@ class FileHotReload:
 
         self.log(f"Hot reloading: {source_path.name}")
 
-        dwarf_functions: List[Dict[str, Any]] = self.find_functions_from_dwarf(
-            source_path
-        )
+        # Use AST to find hotreloadable functions (most accurate)
+        ast_functions: List[str] = self.find_all_functions_in_file(source_path)
 
-        dwarf_functions = [
-            f
-            for f in dwarf_functions
-            if not f["name"].startswith("__")
-            and not f["name"].startswith("_GLOBAL__sub_I_")
-            and f["name"] != "main"
-        ]
+        if not ast_functions:
+            # Fallback: try DWARF symbols if AST fails
+            self.log("  AST parsing failed or found no functions, falling back to DWARF symbols...")
+            dwarf_functions: List[Dict[str, Any]] = self.find_functions_from_dwarf(
+                source_path
+            )
 
-        if not dwarf_functions:
-            self.log("✗ No functions found (compile with -g)")
+            # Filter out unsupported functions from DWARF
+            ast_functions = []
+            for f in dwarf_functions:
+                name = f["name"]
+
+                # Skip obvious ones
+                if name.startswith("__") or name.startswith("_GLOBAL__sub_I_") or name == "main":
+                    continue
+
+                # Skip benchmark macros
+                if name.startswith("BM_") or "BENCHMARK" in name:
+                    continue
+
+                # Extract function name before parenthesis
+                if "(" in name:
+                    before_paren = name.split("(")[0]
+                else:
+                    before_paren = name
+
+                # Skip class methods
+                if "::" in before_paren:
+                    continue
+
+                # Skip template instantiations
+                tokens = before_paren.split()
+                if tokens:
+                    func_name_only = tokens[-1]
+                    if "<" in func_name_only:
+                        continue
+
+                ast_functions.append(name)
+
+        if not ast_functions:
+            self.log("✗ No hotreloadable functions found")
             return (0, 0)
 
-        self.log(
-            f"  Found {len(dwarf_functions)} functions: {[f['name'] for f in dwarf_functions]}"
-        )
+        self.log(f"  Found {len(ast_functions)} hotreloadable function(s): {ast_functions}")
+
+        # Now use DWARF to get addresses for the AST-discovered functions
+        all_dwarf_functions: List[Dict[str, Any]] = self.find_functions_from_dwarf(source_path)
+
+        # Filter DWARF results to only include AST-discovered functions
+        # Need to match by base name since DWARF has signatures like "addOne(int)"
+        # but AST has just "addOne"
+        dwarf_functions: List[Dict[str, Any]] = []
+        for dwarf_func in all_dwarf_functions:
+            dwarf_name = dwarf_func["name"]
+            # Extract base name (before parenthesis)
+            base_name = dwarf_name.split("(")[0] if "(" in dwarf_name else dwarf_name
+
+            # Check if this function was found by AST
+            if base_name in ast_functions:
+                dwarf_functions.append(dwarf_func)
+
+        if not dwarf_functions:
+            self.log("✗ No DWARF symbols found for hotreloadable functions (compile with -g)")
+            return (0, 0)
 
         skipped_on_stack: List[str] = []
         for func_info in dwarf_functions:
