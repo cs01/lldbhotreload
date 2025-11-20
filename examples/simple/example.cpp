@@ -6,7 +6,8 @@ int addOne(const int number) {
   // 2.) Fix this code, then run
   // (lldb) hotreload example.cpp
   // (lldb) c
-  const int plusOne = number + 0;  // BUG: should be number + 1
+  printf("foofoofojjo\n");
+  const int plusOne = number + 11; // BUG: should be number + 1
   return plusOne;
 }
 int main() {
@@ -16,8 +17,10 @@ int main() {
     if (result == number + 1) {
       break;
     } else {
-      printf("addOne(%d) returned %d (off by %d)\n", number, result, result - (number + 1));
-      printf("Fix addOne, save, then run `(lldb) hotreload example.cpp` and continue\n");
+      printf("addOne(%d) returned %d (off by %d)\n", number, result,
+             result - (number + 1));
+      printf("Fix addOne, save, then run `(lldb) hotreload example.cpp` and "
+             "continue\n");
     }
     sleep(1);
     // Put a breakpoint here ^^

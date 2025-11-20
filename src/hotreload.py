@@ -308,7 +308,7 @@ class FileHotReload:
 
     def compile_file_to_shared_lib(
         self, source_file: str | Path, compile_flags: Optional[List[str]] = None,
-        function_line_info: Optional[Dict[str, int]] = None
+        functions_to_compile: Optional[List[str]] = None
     ) -> Optional[Tuple[Path, Dict[str, int]]]:
 
         if compile_flags is None:
@@ -326,7 +326,11 @@ class FileHotReload:
         with open(source_path) as f:
             original_content: str = f.read()
 
-        functions: List[str] = self.find_all_functions_in_file(source_path)
+        # Use provided functions list or discover them via AST
+        if functions_to_compile is None:
+            functions: List[str] = self.find_all_functions_in_file(source_path)
+        else:
+            functions: List[str] = functions_to_compile
 
         modified_content = original_content
         for func_name in functions:
@@ -986,7 +990,9 @@ class FileHotReload:
                 old_so_handle = _FUNCTION_INFO[func_name]["current_so_handle"]
                 break
 
-        compile_result = self.compile_file_to_shared_lib(source_path, compile_flags)
+        compile_result = self.compile_file_to_shared_lib(
+            source_path, compile_flags, functions_to_compile=ast_functions
+        )
         if not compile_result:
             self.log("✗ Compilation failed")
             return (0, 0)
