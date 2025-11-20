@@ -215,7 +215,8 @@ class FileHotReload:
             self.log(f"  Warning: No compile_commands.json found, skipping AST analysis")
             return []
 
-        # Extract the real compiler from Buck2's fbcc wrapper
+        # Extract the real compiler from compilation database
+        # Some build systems use wrapper scripts that pass the real compiler via --cc=
         compiler = None
         for i, flag in enumerate(compile_flags):
             if flag.startswith("--cc="):
@@ -225,8 +226,8 @@ class FileHotReload:
         if not compiler:
             compiler = compile_flags[0]
 
-        # If it's still fbcc or a wrapper, try to find real clang++
-        if "fbcc" in compiler or not compiler.endswith("clang++"):
+        # If compiler is not clang++, fall back to system clang++
+        if not compiler.endswith("clang++"):
             compiler = "/opt/llvm/bin/clang++"
 
         # Build minimal AST dump command (TEXT format, not JSON)
@@ -266,35 +267,77 @@ class FileHotReload:
             source_filename = source_path.name
 
             for line in output.split('\n'):
-                # Look for FunctionDecl lines that reference our source file
-                # Format: |-FunctionDecl ... <file.cpp:line:col, ...> line:X:Y funcname 'signature'
-                if "FunctionDecl" in line and source_filename in line:
-                    # Extract function name and signature
-                    match = re.search(rf"{re.escape(source_filename)}:\d+:\d+.*?(\w+) '([^']+)'", line)
-                    if match:
-                        func_name = match.group(1)
-                        signature = match.group(2)
+                # Look for top-level FunctionDecl lines from the main source file
+                # (top-level = starts with "|-FunctionDecl", not nested in templates)
+                #
+                # We use AST attributes to filter robustly:
+                # ✓ Accept: |-FunctionDecl ... <line:X:Y, ...> line:A:B (real function in main file)
+                # ✗ Reject: nested FunctionDecl (template instantiations, nested classes)
+                # ✗ Reject: <scratch space> (macro-generated function)
+                # ✗ Reject: functions marked 'static' (internal linkage)
+                # ✗ Reject: functions marked 'inline' (may not exist as symbols)
+                # ✗ Reject: ALL_UPPERCASE names (macros like BENCHMARK)
+                # ✗ Reject: template instantiations (< in signature)
+                # ✗ Reject: destructors (start with ~)
+                # ✗ Reject: class methods (:: in name before paren)
+                #
+                if not line.startswith("|-FunctionDecl"):
+                    continue
 
-                        # Filter out functions that can't be hot reloaded:
-                        # - main function
-                        # - Destructors (~ClassName)
-                        # - Internal functions (__xxx)
-                        # - Macro-generated variants (_1e0, _1e1, etc from BENCHMARK macros)
-                        # - Template instantiations (have < in signature)
-                        # - Class methods (have :: before the opening paren)
+                # Only accept functions from the main source file (<line:X:Y> format)
+                if not ("<line:" in line and " line:" in line):
+                    continue
 
-                        # Check for :: in the function name part (before first paren if any)
-                        name_part = func_name.split('(')[0] if '(' in func_name else func_name
+                # Reject macro-generated functions (identified by <scratch space>)
+                if "<scratch space>" in line:
+                    continue
 
-                        if (func_name != "main" and
-                            not func_name.startswith("~") and
-                            not func_name.startswith("__") and
-                            "_1e" not in func_name and  # Skip BENCHMARK macro variants
-                            "::" not in name_part and  # Skip class methods
-                            "<" not in signature):  # Skip template instantiations
+                # Reject static functions (internal linkage - can't reliably patch)
+                if " static" in line:
+                    continue
 
-                            if func_name not in functions:
-                                functions.append(func_name)
+                # Reject inline functions (may not exist as real symbols in binary)
+                if " inline" in line:
+                    continue
+
+                # Extract function name and signature
+                # Format: |-FunctionDecl ... line:X:Y [used] funcname 'signature' [static|inline]
+                match = re.search(r" (\w+) '([^']+)'", line)
+                if not match:
+                    continue
+
+                func_name = match.group(1)
+                signature = match.group(2)
+
+                # Skip main function (can't be hot reloaded)
+                if func_name == "main":
+                    continue
+
+                # Skip macros (usually all uppercase like BENCHMARK, DEFINE_FACTORY, etc.)
+                if func_name.isupper() and len(func_name) > 2:
+                    continue
+
+                # Skip destructors (identified by ~ prefix)
+                if func_name.startswith("~"):
+                    continue
+
+                # Skip internal/compiler functions (__ prefix)
+                if func_name.startswith("__"):
+                    continue
+
+                # Skip template instantiations (have < in signature)
+                if "<" in signature:
+                    continue
+
+                # Skip class methods (have :: in name)
+                # Extract the part before first paren (if any)
+                name_part = func_name.split('(')[0] if '(' in func_name else func_name
+                if "::" in name_part:
+                    continue
+
+                # This function passes all filters - add it
+                if func_name not in functions:
+                    functions.append(func_name)
 
             self.log(f"  AST found {len(functions)} hotreloadable functions")
             return functions
@@ -436,7 +479,18 @@ class FileHotReload:
                 f.write("}\n")
             f.write("}\n")
 
+        # Extract the real compiler from compilation database
+        # Some build systems use wrapper scripts (e.g., ccache, distcc)
+        # that pass the real compiler via --cc= flag
         compiler: str = compile_flags[0]
+        for flag in compile_flags:
+            if flag.startswith("--cc="):
+                compiler = flag.split("=", 1)[1]
+                break
+
+        # Filter out flags that conflict with our compilation
+        # We only remove flags that specify input/output files
+        # All compiler flags (includes, defines, warnings, optimizations) are preserved
         filtered_flags: List[str] = []
         skip_next: bool = False
 
@@ -444,20 +498,42 @@ class FileHotReload:
             if skip_next:
                 skip_next = False
                 continue
-            if flag in ["-o", "-c"]:
+
+            # Skip output file specification (we provide our own)
+            if flag in ["-o"]:
                 skip_next = True
                 continue
-            if flag.endswith((".cpp", ".cc", ".c", ".o")):
+
+            # Skip compile-only flag (we control this explicitly)
+            if flag == "-c":
                 continue
+
+            # Skip input source files (we provide our own)
+            if flag.endswith((".cpp", ".cc", ".c", ".cxx", ".o", ".a")):
+                continue
+
+            # Skip wrapper-specific flags that are not actual compiler flags
+            # These are used by build system wrappers but not recognized by clang++
+            if flag.startswith("--cc=") or flag.startswith("--log-"):
+                continue
+
             filtered_flags.append(flag)
+
+        # TWO-STEP COMPILATION: Separate compile and link phases
+        # This avoids issues with build-system-specific linker flags (ASAN, custom paths, etc.)
+        # and ensures we create a clean, portable shared library
+
+        # Step 1: Compile to object file (.o) using all build system flags
+        # This preserves all include paths, defines, and compiler settings from the original build
+        temp_obj: Path = self.cache_dir / f"{lib_name}.o"
 
         cmd_compile: List[str] = [
             compiler,
+            "-c",  # Compile only, no linking
             *filtered_flags,
             "-fPIC",
-            "-shared",
             "-o",
-            str(temp_so),
+            str(temp_obj),
             str(temp_modified_cpp),
         ]
 
@@ -468,6 +544,28 @@ class FileHotReload:
         )
         if result.returncode != 0:
             self.log(f"✗ Compilation failed:\n{result.stderr}")
+            return None
+
+        # Step 2: Link object file to shared library (.so) using clean system flags
+        # This avoids build-system-specific linker issues and creates a standard shared library
+        cmd_link: List[str] = [
+            compiler,
+            "-shared",
+            "-L/usr/lib/gcc/x86_64-redhat-linux/11",  # System GCC libs
+            "-L/lib64",  # System libraries
+            "-lstdc++",  # C++ standard library
+            "-o",
+            str(temp_so),
+            str(temp_obj),
+        ]
+
+        self.log(f"  → {' '.join(cmd_link)}")
+
+        result = subprocess.run(
+            cmd_link, capture_output=True, text=True, timeout=30
+        )
+        if result.returncode != 0:
+            self.log(f"✗ Linking failed:\n{result.stderr}")
             return None
 
         return (temp_so, function_line_map)
@@ -887,45 +985,6 @@ class FileHotReload:
 
         # Use AST to find hotreloadable functions (most accurate)
         ast_functions: List[str] = self.find_all_functions_in_file(source_path)
-
-        if not ast_functions:
-            # Fallback: try DWARF symbols if AST fails
-            self.log("  AST parsing failed or found no functions, falling back to DWARF symbols...")
-            dwarf_functions: List[Dict[str, Any]] = self.find_functions_from_dwarf(
-                source_path
-            )
-
-            # Filter out unsupported functions from DWARF
-            ast_functions = []
-            for f in dwarf_functions:
-                name = f["name"]
-
-                # Skip obvious ones
-                if name.startswith("__") or name.startswith("_GLOBAL__sub_I_") or name == "main":
-                    continue
-
-                # Skip benchmark macros
-                if name.startswith("BM_") or "BENCHMARK" in name:
-                    continue
-
-                # Extract function name before parenthesis
-                if "(" in name:
-                    before_paren = name.split("(")[0]
-                else:
-                    before_paren = name
-
-                # Skip class methods
-                if "::" in before_paren:
-                    continue
-
-                # Skip template instantiations
-                tokens = before_paren.split()
-                if tokens:
-                    func_name_only = tokens[-1]
-                    if "<" in func_name_only:
-                        continue
-
-                ast_functions.append(name)
 
         if not ast_functions:
             self.log("✗ No hotreloadable functions found")

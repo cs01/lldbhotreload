@@ -1,17 +1,17 @@
 [
   {
     "directory": "/tmp/hotreload_demo",
-    "command": "clang++ -std=c++17 -g -O0 -c utils.cpp -o utils.o",
+    "command": "/opt/llvm/bin/clang++ -std=c++17 -g -O0 -c utils.cpp -o utils.o",
     "file": "/tmp/hotreload_demo/utils.cpp"
   },
   {
     "directory": "/tmp/hotreload_demo",
-    "command": "clang++ -I/tmp/hotreload_demo -std=c++17 -g -O0 -c calculator.cpp -o calculator.o",
+    "command": "/opt/llvm/bin/clang++ -I/tmp/hotreload_demo -std=c++17 -g -O0 -c calculator.cpp -o calculator.o",
     "file": "/tmp/hotreload_demo/calculator.cpp"
   },
   {
     "directory": "/tmp/hotreload_demo",
-    "command": "clang++ -std=c++17 -g -O0 -c main.cpp -o main.o",
+    "command": "/opt/llvm/bin/clang++ -std=c++17 -g -O0 -c main.cpp -o main.o",
     "file": "/tmp/hotreload_demo/main.cpp"
   }
 ]
