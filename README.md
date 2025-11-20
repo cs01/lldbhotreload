@@ -24,11 +24,24 @@ You can also add `command script import /path/to/hotreload.py` to your `~/.lldbi
 
 Changes apply immediately!
 
+## Examples
+
+See [examples/](examples/) for complete working demos:
+- **[simple/](examples/simple/)** - Basic single-file hot reload
+- **[inter-file-deps/](examples/inter-file-deps/)** - Hot reload functions calling other files
+
 ## Requirements
 
 - Linux x86_64
 - LLDB
 - Clang
+
+```bash
+# When building your program:
+clang++ -rdynamic -g -O0 main.cpp utils.cpp -o myapp
+```
+
+The `-rdynamic` flag exports symbols so hot-reloaded code can find functions from your original binary.
 
 ## API
 

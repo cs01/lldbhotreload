@@ -16,6 +16,7 @@ example/example
 .vscode/
 .idea/
 .claude/
+claude.md
 *.swp
 *.swo
 *~

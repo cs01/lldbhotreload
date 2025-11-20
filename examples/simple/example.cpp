@@ -6,7 +6,7 @@ int addOne(const int number) {
   // 2.) Fix this code, then run
   // (lldb) hotreload example.cpp
   // (lldb) c
-  const int plusOne = number - 1;  // BUG: should be number + 1
+  const int plusOne = number + 0;  // BUG: should be number + 1
   return plusOne;
 }
 int main() {
